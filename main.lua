@@ -29,6 +29,25 @@ local CMD = {
     SWARM_EXPLOSION_PULL = 13,
     SWARM_SORT_DEPTH = 14
 }
+local pendingResize = false
+local resizeTimer = 0.0
+
+local function ReinitBuffers()
+    CANVAS_W, CANVAS_H = love.graphics.getPixelDimensions()
+    
+    -- Recalculate FOV based on new aspect ratio
+    MainCamera.fov = (CANVAS_W / 800) * 600
+
+    -- Reallocate the massive RAM chunks
+    ScreenBuffer = love.image.newImageData(CANVAS_W, CANVAS_H)
+    ScreenImage = love.graphics.newImage(ScreenBuffer)
+    ScreenPtr = ffi.cast("uint32_t*", ScreenBuffer:getPointer())
+    ZBuffer = ffi.new("float[?]", CANVAS_W * CANVAS_H)
+
+    -- Force Lua's Garbage Collector to instantly delete the old buffers
+    collectgarbage() 
+    print("[SYSTEM] Buffers Reinitialized: " .. CANVAS_W .. "x" .. CANVAS_H)
+end
 function love.load()
     CANVAS_W, CANVAS_H = love.graphics.getPixelDimensions()
     MainCamera.fov = (CANVAS_W / 800) * 600
@@ -52,6 +71,15 @@ end
 
 function love.update(dt)
     dt = math.min(dt, 0.033)
+    -- [ THE RESIZE INTERCEPT ]
+    if pendingResize then
+        resizeTimer = resizeTimer - dt
+        if resizeTimer <= 0 then
+            ReinitBuffers()
+            pendingResize = false
+        end
+        return -- Skip ALL physics and rendering while dragging the window!
+    end
     global_time = global_time + dt
     Sequence.RunPhase("Tick", dt)
     -- [NEW] Run the benchmark override
@@ -59,6 +87,11 @@ function love.update(dt)
 end
 
 function love.draw()
+    if pendingResize then
+        love.graphics.clear(0.05, 0.05, 0.05)
+        love.graphics.print("REBUILDING SWAPCHAIN...", 20, 20)
+        return
+    end
     local q = Memory.Arrays.CommandQueue
     local q_len = 0
     local mem = Memory.RenderStruct
@@ -130,4 +163,8 @@ function love.quit()
     VibeMath.vmath_shutdown_thread_pool()
     print("[SYSTEM] Threads terminated. Goodbye.")
     return false -- Tells Love2D to proceed with the normal closing process
+end
+function love.resize(w, h)
+    pendingResize = true
+    resizeTimer = 1
 end

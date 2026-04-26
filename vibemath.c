@@ -1686,10 +1686,9 @@ EXPORT void vmath_render_batch(
             sun_x, sun_y, sun_z
         );
     }
-    // --- PHASE 1.5: THE HARDCODED QUAD-BINNER ---
+    // --- PHASE 1.5: THE BRANCHLESS QUAD-BINNER ---
     int band_counts[4] = {0, 0, 0, 0};
-    
-    // Calculate the 3 dividing lines (e.g., on 1080p: 270, 540, 810)
+
     float q1 = CANVAS_H * 0.25f;
     float q2 = CANVAS_H * 0.50f;
     float q3 = CANVAS_H * 0.75f;
@@ -1700,27 +1699,34 @@ EXPORT void vmath_render_batch(
 
         for (int i = 0; i < tCount; i++) {
             int abs_i = tStart + i;
-            if (!mem->Tri_Valid[abs_i]) continue;
+            
+            // Highly predictable branch, perfectly safe to leave as-is
+            if (!mem->Tri_Valid[abs_i]) continue; 
 
             float min_y = mem->Tri_MinY[abs_i];
             float max_y = mem->Tri_MaxY[abs_i];
 
-            // PURE BRANCH PREDICTION (Lightning fast)
-            if (min_y < q1) {
-                g_BandLists[0][band_counts[0]++] = abs_i;
-            }
-            if (max_y >= q1 && min_y < q2) {
-                g_BandLists[1][band_counts[1]++] = abs_i;
-            }
-            if (max_y >= q2 && min_y < q3) {
-                g_BandLists[2][band_counts[2]++] = abs_i;
-            }
-            if (max_y >= q3) {
-                g_BandLists[3][band_counts[3]++] = abs_i;
-            }
+            // 1. Evaluate conditions into pure integers (0 or 1). 
+            // Using bitwise & forces evaluation without short-circuit branching.
+            int m0 = (min_y < q1);
+            int m1 = (max_y >= q1) & (min_y < q2);
+            int m2 = (max_y >= q2) & (min_y < q3);
+            int m3 = (max_y >= q3);
+
+            // 2. Unconditionally write the ID to all 4 lists. No branches!
+            g_BandLists[0][band_counts[0]] = abs_i;
+            g_BandLists[1][band_counts[1]] = abs_i;
+            g_BandLists[2][band_counts[2]] = abs_i;
+            g_BandLists[3][band_counts[3]] = abs_i;
+
+            // 3. Conditionally advance the pointers.
+            // If m0 is 0, the pointer doesn't move, and the data is overwritten next loop.
+            band_counts[0] += m0;
+            band_counts[1] += m1;
+            band_counts[2] += m2;
+            band_counts[3] += m3;
         }
     }
-
     // --- PHASE 2: MUTEX WAKE-UP DISPATCH ---
     float band_height = CANVAS_H * 0.25f; // Quick math for clip bounds
 
