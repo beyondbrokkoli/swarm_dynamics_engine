@@ -79,22 +79,21 @@
 vmath_mutex_t g_phys_mutex;
 vmath_cond_t  g_phys_cv_start;
 vmath_cond_t  g_phys_cv_done;
-int g_phys_sig  = 0; 
+int g_phys_sig  = 0;
 int g_phys_done = 1;
 
-// Top Raster Thread State
-vmath_mutex_t g_top_mutex;
-vmath_cond_t  g_top_cv_start;
-vmath_cond_t  g_top_cv_done;
-int g_top_sig  = 0;
-int g_top_done = 1;
+// --- [N-BAND RASTER STATE] ---
+#define NUM_BANDS 6
+#define MAX_DISP_TRIS_PER_BAND 1000000 // 24MB total RAM. Completely bulletproof.
 
-// Bottom Raster Thread State
-vmath_mutex_t g_bot_mutex;
-vmath_cond_t  g_bot_cv_start;
-vmath_cond_t  g_bot_cv_done;
-int g_bot_sig  = 0;
-int g_bot_done = 1;
+vmath_mutex_t g_band_mutex[NUM_BANDS];
+vmath_cond_t  g_band_cv_start[NUM_BANDS];
+vmath_cond_t  g_band_cv_done[NUM_BANDS];
+int g_band_sig[NUM_BANDS];
+int g_band_done[NUM_BANDS];
+
+int g_BandLists[NUM_BANDS][MAX_DISP_TRIS_PER_BAND];
+
 // ========================================================================
 // FAST AVX2 TRIGONOMETRY (Minimax Approximations)
 // ========================================================================
@@ -216,14 +215,10 @@ typedef struct {
 PhysicsThreadPayload g_physics_payload;
 vmath_thread_t g_physics_thread;
 
-// --- [FIXED] 1 MILLION DISPLAY LIST BUCKETS ---
-#define MAX_DISP_TRIS 1000000 // Safely stores 200k Quads (800k Triangles) + 200k overhead
-int g_TopList[MAX_DISP_TRIS];
-int g_BotList[MAX_DISP_TRIS];
 
 typedef struct {
-    int* display_list;  // <-- Now it takes a specific list of triangles!
-    int list_count;     // <-- How many are in this list
+    int* display_list;
+    int list_count;
     RenderMemory* mem;
     uint32_t* ScreenPtr;
     float* ZBuffer;
@@ -233,10 +228,8 @@ typedef struct {
     int max_clip_y;
 } RasterThreadPayload;
 
-RasterThreadPayload g_raster_top_payload;
-RasterThreadPayload g_raster_bot_payload;
-vmath_thread_t g_raster_top_thread;
-vmath_thread_t g_raster_bot_thread;
+RasterThreadPayload g_raster_payloads[NUM_BANDS];
+vmath_thread_t g_raster_threads[NUM_BANDS];
 
 // ========================================================================
 // MEMORY & PROJECTION (The Core Pipeline)
@@ -1599,31 +1592,25 @@ EXPORT void vmath_swarm_smales(
     }
 }
 // ========================================================
-// CORE 3 & CORE 4: OS-SLEEPING RASTER WORKERS
+// CORE 3+: OS-SLEEPING RASTER WORKERS
 // ========================================================
 THREAD_FUNC vmath_raster_worker(void* arg) {
-    int is_bot = (int)(intptr_t)arg;
-    RasterThreadPayload* p = is_bot ? &g_raster_bot_payload : &g_raster_top_payload;
+    int band_id = (int)(intptr_t)arg;
+    RasterThreadPayload* p = &g_raster_payloads[band_id];
     
-    vmath_mutex_t* my_mutex    = is_bot ? &g_bot_mutex    : &g_top_mutex;
-    vmath_cond_t* my_cv_start = is_bot ? &g_bot_cv_start : &g_top_cv_start;
-    vmath_cond_t* my_cv_done  = is_bot ? &g_bot_cv_done  : &g_top_cv_done;
-    int* my_sig      = is_bot ? &g_bot_sig      : &g_top_sig;
-    int* my_done     = is_bot ? &g_bot_done     : &g_top_done;
-
     while (1) {
-        // 1. LOCK & SLEEP: Give CPU back to OS until signaled
-        vmath_mutex_lock(my_mutex);
-        while (*my_sig == 0) { 
-            vmath_cond_wait(my_cv_start, my_mutex); 
+        // 1. LOCK & SLEEP
+        vmath_mutex_lock(&g_band_mutex[band_id]);
+        while (g_band_sig[band_id] == 0) { 
+            vmath_cond_wait(&g_band_cv_start[band_id], &g_band_mutex[band_id]); 
         }
         
         // 2. CHECK FOR QUIT SIGNAL
-        if (*my_sig == 2) {
-            vmath_mutex_unlock(my_mutex);
+        if (g_band_sig[band_id] == 2) {
+            vmath_mutex_unlock(&g_band_mutex[band_id]);
             break; 
         }
-        vmath_mutex_unlock(my_mutex); // Unlock so main thread doesn't hang
+        vmath_mutex_unlock(&g_band_mutex[band_id]); 
 
         // 3. DO THE HEAVY LIFTING
         RenderMemory* mem = p->mem;
@@ -1636,12 +1623,12 @@ THREAD_FUNC vmath_raster_worker(void* arg) {
             p->min_clip_y, p->max_clip_y
         );
 
-        // 4. WORK FINISHED: Lock, update flags, and wake up main thread
-        vmath_mutex_lock(my_mutex);
-        *my_sig = 0;
-        *my_done = 1;
-        vmath_cond_broadcast(my_cv_done);
-        vmath_mutex_unlock(my_mutex);
+        // 4. WORK FINISHED: Wake up main thread
+        vmath_mutex_lock(&g_band_mutex[band_id]);
+        g_band_sig[band_id] = 0;
+        g_band_done[band_id] = 1;
+        vmath_cond_broadcast(&g_band_cv_done[band_id]);
+        vmath_mutex_unlock(&g_band_mutex[band_id]);
     }
     return THREAD_RETURN_VAL;
 }
@@ -1699,10 +1686,10 @@ EXPORT void vmath_render_batch(
             sun_x, sun_y, sun_z
         );
     }
-    // --- PHASE 1.5: THE CACHE-PERFECT BINNER ---
-    int top_count = 0;
-    int bot_count = 0;
-    int mid_y = CANVAS_H / 2;
+    // --- PHASE 1.5: THE N-BAND BINNER ---
+    int band_counts[NUM_BANDS] = {0};
+    float band_height = (float)CANVAS_H / NUM_BANDS;
+    float inv_band_height = (float)NUM_BANDS / (float)CANVAS_H; // Calculate once!
 
     for (int id = start_id; id <= end_id; id++) {
         int tStart = mem->Obj_TriStart[id];
@@ -1710,57 +1697,54 @@ EXPORT void vmath_render_batch(
 
         for (int i = 0; i < tCount; i++) {
             int abs_i = tStart + i;
-
             if (!mem->Tri_Valid[abs_i]) continue;
 
-            // BLISTERING FAST: Pure sequential reads from linear RAM!
             float min_y = mem->Tri_MinY[abs_i];
             float max_y = mem->Tri_MaxY[abs_i];
 
-            if (min_y < mid_y) {
-                g_TopList[top_count++] = abs_i;
-            }
-            if (max_y >= mid_y) {
-                g_BotList[bot_count++] = abs_i;
+            // Calculate which bands this triangle overlaps
+            int start_band = (int)(min_y * inv_band_height); // Lightning fast multiply
+            int end_band   = (int)(max_y * inv_band_height);
+
+            if (start_band < 0) start_band = 0;
+            if (end_band >= NUM_BANDS) end_band = NUM_BANDS - 1;
+
+            // Add the triangle to EVERY band it touches
+            for (int b = start_band; b <= end_band; b++) {
+                g_BandLists[b][band_counts[b]++] = abs_i;
             }
         }
     }
+
     // --- PHASE 2: MUTEX WAKE-UP DISPATCH ---
-    g_raster_top_payload.display_list = g_TopList; g_raster_top_payload.list_count = top_count; // (Assuming top_count populated above)
-    // ... setup payloads ...
-    g_raster_top_payload.display_list = g_TopList; g_raster_top_payload.list_count = top_count;
-    g_raster_top_payload.mem = mem; g_raster_top_payload.ScreenPtr = ScreenPtr; g_raster_top_payload.ZBuffer = ZBuffer;
-    g_raster_top_payload.CANVAS_W = CANVAS_W; g_raster_top_payload.CANVAS_H = CANVAS_H;
-    g_raster_top_payload.min_clip_y = 0; g_raster_top_payload.max_clip_y = mid_y - 1;
+    for (int b = 0; b < NUM_BANDS; b++) {
+        g_raster_payloads[b].display_list = g_BandLists[b]; 
+        g_raster_payloads[b].list_count = band_counts[b];
+        g_raster_payloads[b].mem = mem; 
+        g_raster_payloads[b].ScreenPtr = ScreenPtr; 
+        g_raster_payloads[b].ZBuffer = ZBuffer;
+        g_raster_payloads[b].CANVAS_W = CANVAS_W; 
+        g_raster_payloads[b].CANVAS_H = CANVAS_H;
+        g_raster_payloads[b].min_clip_y = (int)(b * band_height); 
+        g_raster_payloads[b].max_clip_y = (b == NUM_BANDS - 1) ? CANVAS_H - 1 : (int)((b + 1) * band_height) - 1;
 
-    g_raster_bot_payload.display_list = g_BotList; g_raster_bot_payload.list_count = bot_count;
-    g_raster_bot_payload.mem = mem; g_raster_bot_payload.ScreenPtr = ScreenPtr; g_raster_bot_payload.ZBuffer = ZBuffer;
-    g_raster_bot_payload.CANVAS_W = CANVAS_W; g_raster_bot_payload.CANVAS_H = CANVAS_H;
-    g_raster_bot_payload.min_clip_y = mid_y; g_raster_bot_payload.max_clip_y = CANVAS_H - 1;
-    // WAKE UP TOP THREAD
-    vmath_mutex_lock(&g_top_mutex);
-    g_top_done = 0;
-    g_top_sig = 1;
-    vmath_cond_broadcast(&g_top_cv_start);
-    vmath_mutex_unlock(&g_top_mutex);
+        // WAKE UP BAND THREAD
+        vmath_mutex_lock(&g_band_mutex[b]);
+        g_band_done[b] = 0;
+        g_band_sig[b] = 1;
+        vmath_cond_broadcast(&g_band_cv_start[b]);
+        vmath_mutex_unlock(&g_band_mutex[b]);
+    }
 
-    // WAKE UP BOTTOM THREAD
-    vmath_mutex_lock(&g_bot_mutex);
-    g_bot_done = 0;
-    g_bot_sig = 1;
-    vmath_cond_broadcast(&g_bot_cv_start);
-    vmath_mutex_unlock(&g_bot_mutex);
-
-    // SYNCHRONIZATION: Sleep main thread until both reply they are done
-    vmath_mutex_lock(&g_top_mutex);
-    while (g_top_done == 0) { vmath_cond_wait(&g_top_cv_done, &g_top_mutex); }
-    vmath_mutex_unlock(&g_top_mutex);
-
-    vmath_mutex_lock(&g_bot_mutex);
-    while (g_bot_done == 0) { vmath_cond_wait(&g_bot_cv_done, &g_bot_mutex); }
-    vmath_mutex_unlock(&g_bot_mutex);
+    // SYNCHRONIZATION: Sleep main thread until ALL bands reply they are done
+    for (int b = 0; b < NUM_BANDS; b++) {
+        vmath_mutex_lock(&g_band_mutex[b]);
+        while (g_band_done[b] == 0) { 
+            vmath_cond_wait(&g_band_cv_done[b], &g_band_mutex[b]); 
+        }
+        vmath_mutex_unlock(&g_band_mutex[b]);
+    }
 }
-
 // A dead-simple scalar sphere. No noise, no SIMD, purely a stable target for our Transition Weaving tests.
 EXPORT void vmath_generate_basic_sphere(float* lx, float* ly, float* lz, int latitudes, int longitudes, float radius) {
     int idx = 0;
@@ -2000,30 +1984,38 @@ EXPORT void vmath_execute_queue(
 // BOOT & SHUTDOWN (The Mutex Initializers)
 // ========================================================
 EXPORT void vmath_init_thread_pool() {
-    // 1. Initialize all OS locks & signals
     vmath_mutex_init(&g_phys_mutex); vmath_cond_init(&g_phys_cv_start); vmath_cond_init(&g_phys_cv_done);
-    vmath_mutex_init(&g_top_mutex);  vmath_cond_init(&g_top_cv_start);  vmath_cond_init(&g_top_cv_done);
-    vmath_mutex_init(&g_bot_mutex);  vmath_cond_init(&g_bot_cv_start);  vmath_cond_init(&g_bot_cv_done);
-
-    // 2. Launch the sleeping threads
     g_physics_thread = vmath_thread_start(vmath_physics_worker, NULL);
-    g_raster_top_thread = vmath_thread_start(vmath_raster_worker, (void*)(intptr_t)0);
-    g_raster_bot_thread = vmath_thread_start(vmath_raster_worker, (void*)(intptr_t)1);
+
+    // Initialize N-Bands
+    for (int b = 0; b < NUM_BANDS; b++) {
+        vmath_mutex_init(&g_band_mutex[b]); 
+        vmath_cond_init(&g_band_cv_start[b]);  
+        vmath_cond_init(&g_band_cv_done[b]);
+        g_band_sig[b] = 0;
+        g_band_done[b] = 1;
+        // Pass the index 'b' so the thread knows who it is
+        g_raster_threads[b] = vmath_thread_start(vmath_raster_worker, (void*)(intptr_t)b);
+    }
 }
 
 EXPORT void vmath_shutdown_thread_pool() {
-    // 1. Send QUIT signal and wake everyone up
+    // Shutdown Physics
     vmath_mutex_lock(&g_phys_mutex); g_phys_sig = 2; vmath_cond_broadcast(&g_phys_cv_start); vmath_mutex_unlock(&g_phys_mutex);
-    vmath_mutex_lock(&g_top_mutex);  g_top_sig = 2;  vmath_cond_broadcast(&g_top_cv_start);  vmath_mutex_unlock(&g_top_mutex);
-    vmath_mutex_lock(&g_bot_mutex);  g_bot_sig = 2;  vmath_cond_broadcast(&g_bot_cv_start);  vmath_mutex_unlock(&g_bot_mutex);
-
-    // 2. Wait for safe exit
     vmath_thread_join(g_physics_thread);
-    vmath_thread_join(g_raster_top_thread);
-    vmath_thread_join(g_raster_bot_thread);
-
-    // 3. Clean up OS resources
     vmath_mutex_destroy(&g_phys_mutex); vmath_cond_destroy(&g_phys_cv_start); vmath_cond_destroy(&g_phys_cv_done);
-    vmath_mutex_destroy(&g_top_mutex);  vmath_cond_destroy(&g_top_cv_start);  vmath_cond_destroy(&g_top_cv_done);
-    vmath_mutex_destroy(&g_bot_mutex);  vmath_cond_destroy(&g_bot_cv_start);  vmath_cond_destroy(&g_bot_cv_done);
+
+    // Shutdown N-Bands
+    for (int b = 0; b < NUM_BANDS; b++) {
+        vmath_mutex_lock(&g_band_mutex[b]);  
+        g_band_sig[b] = 2;  
+        vmath_cond_broadcast(&g_band_cv_start[b]);  
+        vmath_mutex_unlock(&g_band_mutex[b]);
+
+        vmath_thread_join(g_raster_threads[b]);
+
+        vmath_mutex_destroy(&g_band_mutex[b]);  
+        vmath_cond_destroy(&g_band_cv_start[b]);  
+        vmath_cond_destroy(&g_band_cv_done[b]);
+    }
 }
