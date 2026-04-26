@@ -1752,6 +1752,115 @@ EXPORT void vmath_render_batch(
         vmath_mutex_unlock(&g_band_mutex[b]);
     }
 }
+EXPORT void vmath_render_batch(
+    int start_id, int end_id,
+    CameraState* cam, float HALF_W, float HALF_H, float sun_x, float sun_y, float sun_z,
+    RenderMemory* mem, uint32_t* ScreenPtr, float* ZBuffer, int CANVAS_W, int CANVAS_H
+) {
+    float cpx = cam->x, cpy = cam->y, cpz = cam->z;
+    float cfw_x = cam->fwx, cfw_y = cam->fwy, cfw_z = cam->fwz;
+    float crt_x = cam->rtx, crt_z = cam->rtz;
+    float cup_x = cam->upx, cup_y = cam->upy, cup_z = cam->upz;
+    float cam_fov = cam->fov;
+
+    // --- PHASE 1: MAIN THREAD DOES PROJECTION AND LIGHTING ---
+    for (int id = start_id; id <= end_id; id++) {
+        float r = mem->Obj_Radius[id];
+        float ox = mem->Obj_X[id], oy = mem->Obj_Y[id], oz = mem->Obj_Z[id];
+
+        float cz_center = (ox - cpx)*cfw_x + (oy - cpy)*cfw_y + (oz - cpz)*cfw_z;
+        if (cz_center + r < 0.1f) continue;
+
+        float rx = mem->Obj_RTX[id], ry = mem->Obj_RTY[id], rz = mem->Obj_RTZ[id];
+        float ux = mem->Obj_UPX[id], uy = mem->Obj_UPY[id], uz = mem->Obj_UPZ[id];
+        float fx = mem->Obj_FWX[id], fy = mem->Obj_FWY[id], fz = mem->Obj_FWZ[id];
+        int vStart = mem->Obj_VertStart[id], vCount = mem->Obj_VertCount[id];
+        int tStart = mem->Obj_TriStart[id], tCount = mem->Obj_TriCount[id];
+
+        vmath_project_vertices(
+            vCount,
+            mem->Vert_LX + vStart, mem->Vert_LY + vStart, mem->Vert_LZ + vStart,
+            mem->Vert_PX + vStart, mem->Vert_PY + vStart, mem->Vert_PZ + vStart, mem->Vert_Valid + vStart,
+            ox, oy, oz, rx, ry, rz, ux, uy, uz, fx, fy, fz,
+            cpx, cpy, cpz, cfw_x, cfw_y, cfw_z, crt_x, crt_z, cup_x, cup_y, cup_z,
+            cam_fov, HALF_W, HALF_H
+        );
+
+        vmath_process_triangles(
+            tCount,
+            mem->Tri_V1 + tStart, mem->Tri_V2 + tStart, mem->Tri_V3 + tStart, mem->Vert_Valid,
+            mem->Vert_PX, mem->Vert_PY, mem->Vert_PZ, mem->Vert_LX, mem->Vert_LY, mem->Vert_LZ,
+            mem->Tri_BakedColor + tStart, mem->Tri_ShadedColor + tStart, mem->Tri_Valid + tStart,
+
+            // THE BUG IS DEAD: Added + tStart to the Bounding Boxes
+            mem->Tri_MinY + tStart, mem->Tri_MaxY + tStart,
+
+            // THE NUCLEAR CACHE: Added + tStart to the Pre-Baked Normals
+            mem->Tri_LNX + tStart, mem->Tri_LNY + tStart, mem->Tri_LNZ + tStart,
+
+            rx, ry, rz, ux, uy, uz, fx, fy, fz,
+            sun_x, sun_y, sun_z
+        );
+    }
+    // --- PHASE 1.5: THE N-BAND BINNER ---
+    int band_counts[NUM_BANDS] = {0};
+    float band_height = (float)CANVAS_H / NUM_BANDS;
+    float inv_band_height = (float)NUM_BANDS / (float)CANVAS_H; // Calculate once!
+
+    for (int id = start_id; id <= end_id; id++) {
+        int tStart = mem->Obj_TriStart[id];
+        int tCount = mem->Obj_TriCount[id];
+
+        for (int i = 0; i < tCount; i++) {
+            int abs_i = tStart + i;
+            if (!mem->Tri_Valid[abs_i]) continue;
+
+            float min_y = mem->Tri_MinY[abs_i];
+            float max_y = mem->Tri_MaxY[abs_i];
+
+            // Calculate which bands this triangle overlaps
+            int start_band = (int)(min_y * inv_band_height); // Lightning fast multiply
+            int end_band   = (int)(max_y * inv_band_height);
+
+            if (start_band < 0) start_band = 0;
+            if (end_band >= NUM_BANDS) end_band = NUM_BANDS - 1;
+
+            // Add the triangle to EVERY band it touches
+            for (int b = start_band; b <= end_band; b++) {
+                g_BandLists[b][band_counts[b]++] = abs_i;
+            }
+        }
+    }
+
+    // --- PHASE 2: MUTEX WAKE-UP DISPATCH ---
+    for (int b = 0; b < NUM_BANDS; b++) {
+        g_raster_payloads[b].display_list = g_BandLists[b]; 
+        g_raster_payloads[b].list_count = band_counts[b];
+        g_raster_payloads[b].mem = mem; 
+        g_raster_payloads[b].ScreenPtr = ScreenPtr; 
+        g_raster_payloads[b].ZBuffer = ZBuffer;
+        g_raster_payloads[b].CANVAS_W = CANVAS_W; 
+        g_raster_payloads[b].CANVAS_H = CANVAS_H;
+        g_raster_payloads[b].min_clip_y = (int)(b * band_height); 
+        g_raster_payloads[b].max_clip_y = (b == NUM_BANDS - 1) ? CANVAS_H - 1 : (int)((b + 1) * band_height) - 1;
+
+        // WAKE UP BAND THREAD
+        vmath_mutex_lock(&g_band_mutex[b]);
+        g_band_done[b] = 0;
+        g_band_sig[b] = 1;
+        vmath_cond_broadcast(&g_band_cv_start[b]);
+        vmath_mutex_unlock(&g_band_mutex[b]);
+    }
+
+    // SYNCHRONIZATION: Sleep main thread until ALL bands reply they are done
+    for (int b = 0; b < NUM_BANDS; b++) {
+        vmath_mutex_lock(&g_band_mutex[b]);
+        while (g_band_done[b] == 0) { 
+            vmath_cond_wait(&g_band_cv_done[b], &g_band_mutex[b]); 
+        }
+        vmath_mutex_unlock(&g_band_mutex[b]);
+    }
+}
 // A dead-simple scalar sphere. No noise, no SIMD, purely a stable target for our Transition Weaving tests.
 EXPORT void vmath_generate_basic_sphere(float* lx, float* ly, float* lz, int latitudes, int longitudes, float radius) {
     int idx = 0;

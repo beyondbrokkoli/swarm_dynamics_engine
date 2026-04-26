@@ -3,7 +3,7 @@ local Memory = require("memory")
 
 return function()
     local Swarm = {}
-    local PCOUNT = 10000
+    local PCOUNT = 10007
     local target_state = 0
     local gravity_blend = 1.0
     local metal_blend = 0.0    -- Restored!
@@ -87,7 +87,10 @@ return function()
             tIdx = tIdx + 1
         end
     end
-
+    -- Allow external modules to hijack the physics state
+    function Swarm.ForceState(state)
+        target_state = state
+    end
     function Swarm.Tick(dt)
         local space_down = love.keyboard.isDown("space")
         if space_down and not space_pressed_last then
