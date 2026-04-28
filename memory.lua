@@ -36,16 +36,16 @@ local function AllocateSoA(type_str, count, names)
     local bytes_needed = ffi.sizeof(base_type) * count
 
     -- 2. Over-allocate by 64 bytes to guarantee room for shifting
-    local alloc_size = bytes_needed + 64 
+    local alloc_size = bytes_needed + 64
 
     for i = 1, #names do
         local name = names[i]
-        
+
         -- 3. Allocate raw bytes
         local raw_bytes = ffi.new("uint8_t[?]", alloc_size)
-        
+
         -- 4. ANCHOR IT! Prevents the Garbage Collector from vaporizing our memory
-        Memory.Anchors[name] = raw_bytes 
+        Memory.Anchors[name] = raw_bytes
 
         -- 5. Calculate the exact offset needed to hit a 64-byte boundary
         local ptr_num = tonumber(ffi.cast("uintptr_t", raw_bytes))
@@ -178,15 +178,19 @@ ffi.cdef[[
         float *Swarm_TempDistances;
     } RenderMemory;
 
-    // THE COMMAND QUEUE (Our one and only entry point)
+    // ENGINE BINDING (Call Once on Startup)
+    void vmath_bind_engine(RenderMemory* mem, CameraState* cam, int* queue);
+
+    // RESOLUTION BINDING (Call on Startup & Resize)
+    void vmath_set_resolution(int w, int h, uint32_t* screen_ptr, float* z_buffer);
+
+    // THE LEAN COMMAND QUEUE (Call Every Frame)
     void vmath_execute_queue(
-        int* queue, int command_count,
-        CameraState* cam, RenderMemory* mem,
-        uint32_t* ScreenPtr, float* ZBuffer,
-        int CANVAS_W, int CANVAS_H,
+        int command_count,
         float time, float dt,
-        int read_idx, int write_idx //
+        int read_idx, int write_idx
     );
+
     void vmath_init_thread_pool();
     void vmath_shutdown_thread_pool();
 ]]

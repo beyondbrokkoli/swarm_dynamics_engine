@@ -34,7 +34,7 @@ local resizeTimer = 0.0
 
 local function ReinitBuffers()
     CANVAS_W, CANVAS_H = love.graphics.getPixelDimensions()
-    
+
     -- Recalculate FOV based on new aspect ratio
     MainCamera.fov = (CANVAS_W / 800) * 600
 
@@ -44,31 +44,34 @@ local function ReinitBuffers()
     ScreenPtr = ffi.cast("uint32_t*", ScreenBuffer:getPointer())
     ZBuffer = ffi.new("float[?]", CANVAS_W * CANVAS_H)
 
+    -- [NEW] Pass the fresh dimensions and pointers directly to the C Backend
+    VibeMath.vmath_set_resolution(CANVAS_W, CANVAS_H, ScreenPtr, ZBuffer)
+
     -- Force Lua's Garbage Collector to instantly delete the old buffers
-    collectgarbage() 
+    collectgarbage()
     print("[SYSTEM] Buffers Reinitialized: " .. CANVAS_W .. "x" .. CANVAS_H)
 end
 function love.load()
-    CANVAS_W, CANVAS_H = love.graphics.getPixelDimensions()
-    MainCamera.fov = (CANVAS_W / 800) * 600
+    -- 1. Bind the permanent memory architecture to C once!
+    VibeMath.vmath_bind_engine(Memory.RenderStruct, MainCamera, Memory.Arrays.CommandQueue)
 
-    ScreenBuffer = love.image.newImageData(CANVAS_W, CANVAS_H)
-    ScreenImage = love.graphics.newImage(ScreenBuffer)
-    ScreenPtr = ffi.cast("uint32_t*", ScreenBuffer:getPointer())
-    ZBuffer = ffi.new("float[?]", CANVAS_W * CANVAS_H)
+    -- 2. Initialize dimensions, FOV, Buffers, and push them to the C-Backend
+    ReinitBuffers()
 
+    -- 3. Load your Lua Modules
     Sequence.LoadModule("camera", MainCamera)
     Sequence.LoadModule("swarm")
-    -- [NEW] Cache the reference exactly once after loading!
+
+    -- Cache the references exactly once after loading
     SwarmModule = Sequence.Loaded["swarm"]
     CameraModule = Sequence.Loaded["camera"]
 
     Sequence.RunPhase("Init")
-    -- Ignite the Permanent Quad-Core Engine!
-    VibeMath.vmath_init_thread_pool()
-    collectgarbage()
-end
 
+    -- 4. Ignite the Permanent Quad-Core Engine!
+    VibeMath.vmath_init_thread_pool()
+
+end
 function love.update(dt)
     dt = math.min(dt, 0.033)
     -- [ THE RESIZE INTERCEPT ]
@@ -131,13 +134,12 @@ function love.draw()
     -- Ping-Pong the buffers!
     read_buffer, write_buffer = write_buffer, read_buffer
 
+    -- [NEW] The ultra-lean FFI boundary crossing! Fits entirely in fast CPU registers.
     VibeMath.vmath_execute_queue(
-        q, q_len,
-        MainCamera, mem,
-        ScreenPtr, ZBuffer, CANVAS_W, CANVAS_H,
-        global_time, love.timer.getDelta(), read_buffer, write_buffer
+        q_len,
+        global_time, love.timer.getDelta(),
+        read_buffer, write_buffer
     )
-
 
     ScreenImage:replacePixels(ScreenBuffer)
     love.graphics.setColor(1, 1, 1, 1)
